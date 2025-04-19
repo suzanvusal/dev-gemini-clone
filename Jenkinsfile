@@ -1,184 +1,185 @@
 @Library('Shared')_
 
 pipeline {
-    agent { label 'dev-server' }
+    agent { 
+        label 'dev-server' 
+    }
     
     environment {
-        SONAR_HOME = tool "Sonar"
-        DOCKER_IMAGE  = "geminiamit"
-        GIT_REPO      = "https://github.com/Amitabh-DevOps/dev-gemini-clone.git"
-        GIT_BRANCH    = "DevOps"
-        DOCKERHUB_USERNAME = "amitabhdevops"
-        DOCKER_IMAGE_NAME = "${DOCKERHUB_USERNAME}/${DOCKER_IMAGE}"
+        // Consolidated environment variables
+        DOCKER_IMAGE        = "geminiamit"
+        GIT_REPO           = "https://github.com/Amitabh-DevOps/dev-gemini-clone.git"
+        GIT_BRANCH         = "DevOps"
+        DOCKERHUB_CREDS    = credentials('dockerhub-creds')  // Use Jenkins credentials
+        DOCKER_IMAGE_NAME  = "${DOCKERHUB_CREDS_USR}/${DOCKER_IMAGE}"
+        NODE_VERSION       = "18"                            // Explicit version pinning
+        TRIVY_SEVERITY     = "CRITICAL,HIGH"                 // Security scan threshold
     }
+
     parameters {
-        string(name: 'GEMINI_DOCKER_TAG', defaultValue: 'v1', description: 'Setting docker image for latest push')
+        string(name: 'GEMINI_DOCKER_TAG', defaultValue: 'v1-${BUILD_NUMBER}', description: 'Auto-incremented tag with build number')
     }
+
+    options {
+        timeout(time: 30, unit: 'MINUTES')                   // Fail if stuck
+        buildDiscarder(logRotator(numToKeepStr: '10'))       // Clean old builds
+        disableConcurrentBuilds()                            // Avoid race conditions
+    }
+
     stages {
         stage("Clean Workspace") {
             steps {
                 cleanWs()
+                // Free disk space aggressively
+                sh 'docker system prune -af --volumes || true'
             }
         }
-        stage("Code") {
+
+        stage("Code Checkout") {
             steps {
-                // Use GIT_REPO and GIT_BRANCH from environment variables
-                clone("${GIT_REPO}", "${GIT_BRANCH}")
-                echo "Code cloning done from ${GIT_REPO} branch ${GIT_BRANCH}."
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "${GIT_BRANCH}"]],
+                    extensions: [
+                        // Shallow clone for faster checkout
+                        [$class: 'CloneOption', depth: 1, shallow: true],
+                        // Clean after checkout
+                        [$class: 'CleanBeforeCheckout']
+                    ],
+                    userRemoteConfigs: [[
+                        url: "${GIT_REPO}",
+                        // Use SSH credentials for security
+                        credentialsId: 'github-ssh-key'
+                    ]]
+                ])
             }
         }
-        stage("Prepare Environment File") {
+
+        stage("Build & Test") {
+            parallel {
+                stage("Build Docker Image") {
+                    steps {
+                        script {
+                            // Multi-arch build support
+                            docker.build(
+                                "${DOCKER_IMAGE_NAME}:${params.GEMINI_DOCKER_TAG}",
+                                "--build-arg NODE_VERSION=${NODE_VERSION} ."
+                            )
+                        }
+                    }
+                }
+                stage("Unit Tests") {
+                    steps {
+                        sh 'npm test'
+                        junit '**/test-results.xml'  // Publish test results
+                    }
+                }
+            }
+        }
+
+        stage("Security Scans") {
+            parallel {
+                stage("SonarQube Analysis") {
+                    steps {
+                        withSonarQubeEnv('Sonar') {
+                            sh """
+                            sonar-scanner \
+                                -Dsonar.projectKey=${DOCKER_IMAGE} \
+                                -Dsonar.sources=. \
+                                -Dsonar.exclusions=node_modules/**
+                            """
+                        }
+                    }
+                }
+                stage("Trivy Scan") {
+                    steps {
+                        sh """
+                        trivy image --exit-code 1 \
+                            --severity ${TRIVY_SEVERITY} \
+                            --ignore-unfixed \
+                            --format sarif \
+                            --output trivy-results.sarif \
+                            ${DOCKER_IMAGE_NAME}:${params.GEMINI_DOCKER_TAG}
+                        """
+                        archiveArtifacts 'trivy-results.sarif'
+                    }
+                }
+                stage("Dependency Check") {
+                    steps {
+                        dependencyCheckAnalyzer(
+                            datadir: '',
+                            hintsFile: '',
+                            includeVulnReports: true,
+                            odcInstallation: 'OWASP',
+                            scanSet: '**/*.*',
+                            skipOnScmChange: false,
+                            skipOnUpstreamChange: false
+                        )
+                        dependencyCheckPublisher(
+                            pattern: '**/dependency-check-report.xml'
+                        )
+                    }
+                }
+            }
+        }
+
+        stage("Quality Gate") {
             steps {
-                prepareEnvFile('.env.local', '.env.local')
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
             }
         }
-        stage("Build") {
-            steps {
-                dockerbuild("${DOCKER_IMAGE}", "${params.GEMINI_DOCKER_TAG}")
-                echo "Docker image ${DOCKER_IMAGE}:${params.GEMINI_DOCKER_TAG} built successfully."
-            }
-        }
-        stage("SonarQube Quality Analysis") {
-            steps {
-                sonarqube_analysis('Sonar', "${DOCKER_IMAGE}", "${DOCKER_IMAGE}")
-            }
-        }
-        stage("OWASP : Dependency Check") {
-            steps {
-                owasp_dependency()
-            }
-        }
-        stage("Sonar Quality Gate Scan") {
-            steps {
-                sonarqube_code_quality()
-            }
-        }
-        stage("Docker Image Security Scan (Trivy)") {
-            steps {
-                dockerScanTrivy("${DOCKER_IMAGE}", "${params.GEMINI_DOCKER_TAG}")
-                echo "Trivy scan completed for ${DOCKER_IMAGE}:${params.GEMINI_DOCKER_TAG}."
-            }
-        }
-        stage("Push to DockerHub") {
-            steps {
-                dockerpush("dockerHub", "${DOCKER_IMAGE}", "${params.GEMINI_DOCKER_TAG}")
-                echo "Pushed ${DOCKERHUB_USERNAME}/${DOCKER_IMAGE}:${params.GEMINI_DOCKER_TAG} to DockerHub."
-            }
-        }
-        // Uncommented and updated the "Run Container" stage to use environment variables
-        // stage("Run Container") {
-        //     steps {
-        //         dockerRunApp("${DOCKER_IMAGE}", "${params.GEMINI_DOCKER_TAG}", "env_local", "${DOCKER_IMAGE}", "--env-file .env.local -p 3000:3000")
-        //         echo "Container started using ${DOCKER_IMAGE}:${DOCKER_TAG} with container name '${DOCKER_IMAGE}'."
-        //     }
-        // }
-        stage("Cleanup Docker Images") {
+
+        stage("Push to Registry") {
             steps {
                 script {
-                    sh "docker rmi ${DOCKER_IMAGE}:${params.GEMINI_DOCKER_TAG} || true"
-                    sh "docker rmi ${DOCKERHUB_USERNAME}/${DOCKER_IMAGE}:${params.GEMINI_DOCKER_TAG} || true"
-                    sh "docker image prune -f"
+                    docker.withRegistry('https://registry.hub.docker.com', 'dockerhub-creds') {
+                        docker.image("${DOCKER_IMAGE_NAME}:${params.GEMINI_DOCKER_TAG}").push()
+                        // Tag as latest for stable deployments
+                        docker.image("${DOCKER_IMAGE_NAME}:${params.GEMINI_DOCKER_TAG}").push('latest')
+                    }
                 }
-                echo "Cleaned up Docker image: ${DOCKERHUB_USERNAME}/${DOCKER_IMAGE}:${params.GEMINI_DOCKER_TAG}."
             }
         }
     }
+
     post {
+        always {
+            // Always clean up
+            sh 'docker system prune -af || true'
+            script {
+                currentBuild.description = "Tag: ${params.GEMINI_DOCKER_TAG}"
+            }
+        }
         success {
-            archiveArtifacts artifacts: 'kubernetes/gemini-deployment.yml', followSymlinks: false
-            build job: "Gemini-CD", parameters: [
-                string(name: 'GEMINI_DOCKER_TAG', value: "${params.GEMINI_DOCKER_TAG}")
-            ]
-            echo "Pipeline completed successfully!"
-            emailext (
-                subject: "SUCCESS: Jenkins Pipeline for ${DOCKER_IMAGE}",
-                body: """
-                    <div style="font-family: Arial, sans-serif; padding: 20px; border: 2px solid #4CAF50; border-radius: 10px;">
-                        <h2 style="color: #4CAF50;">🎉 Pipeline Execution: SUCCESS 🎉</h2>
-                        <p style="font-size: 16px; color: #333;">
-                            Hello Team,
-                        </p>
-                        <p style="font-size: 16px; color: #333;">
-                            The Jenkins CI pipeline for <strong style="color: #4CAF50;">${DOCKER_IMAGE}</strong> completed <strong style="color: #4CAF50;">successfully</strong>!
-                        </p>
-                        <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
-                            <tr style="background-color: #f2f2f2;">
-                                <th style="text-align: left; padding: 8px; border: 1px solid #ddd;">Details</th>
-                                <th style="text-align: left; padding: 8px; border: 1px solid #ddd;">Values</th>
-                            </tr>
-                            <tr>
-                                <td style="padding: 8px; border: 1px solid #ddd;">Git Repository</td>
-                                <td style="padding: 8px; border: 1px solid #ddd;">${GIT_REPO}</td>
-                            </tr>
-                            <tr>
-                                <td style="padding: 8px; border: 1px solid #ddd;">Branch</td>
-                                <td style="padding: 8px; border: 1px solid #ddd;">${GIT_BRANCH}</td>
-                            </tr>
-                            <tr>
-                                <td style="padding: 8px; border: 1px solid #ddd;">Docker Image</td>
-                                <td style="padding: 8px; border: 1px solid #ddd;">${DOCKERHUB_USERNAME}/${DOCKER_IMAGE}:${params.GEMINI_DOCKER_TAG}</td>
-                            </tr>
-                        </table>
-                        <p style="font-size: 16px; color: #333; margin-top: 20px;">
-                            Visit <a href="${BUILD_URL}" style="color: #4CAF50;">Pipeline Logs</a> for more details.
-                        </p>
-                        <p style="font-size: 16px; color: #333; margin-top: 20px;">
-                            Thanks,<br>
-                            <strong>Jenkins</strong>
-                        </p>
-                    </div>
-                """,
-                to: "amitabhdevops2024@gmail.com",
-                from: "jenkins@example.com",
-                mimeType: 'text/html',
-                attachmentsPattern: '**/table-report.html'
+            build job: "Gemini-CD", 
+                  parameters: [string(name: 'GEMINI_DOCKER_TAG', value: "${params.GEMINI_DOCKER_TAG}")],
+                  wait: false  // Async trigger
+            // Enhanced notification
+            slackSend(
+                color: 'good',
+                message: """✅ SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER}
+                            | Image: ${DOCKER_IMAGE_NAME}:${params.GEMINI_DOCKER_TAG}
+                            | Branch: ${GIT_BRANCH}
+                            | Details: ${env.BUILD_URL}"""
             )
         }
         failure {
-            echo "Pipeline failed. Please check the logs."
-            emailext (
-                subject: "FAILURE: Jenkins Pipeline for ${DOCKER_IMAGE}",
-                body: """
-                    <div style="font-family: Arial, sans-serif; padding: 20px; border: 2px solid #F44336; border-radius: 10px;">
-                        <h2 style="color: #F44336;">🚨 Pipeline Execution: FAILURE 🚨</h2>
-                        <p style="font-size: 16px; color: #333;">
-                            Hello Team,
-                        </p>
-                        <p style="font-size: 16px; color: #333;">
-                            Unfortunately, the Jenkins CI pipeline for <strong style="color: #F44336;">${DOCKER_IMAGE}</strong> has <strong style="color: #F44336;">failed</strong>.
-                        </p>
-                        <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
-                            <tr style="background-color: #f2f2f2;">
-                                <th style="text-align: left; padding: 8px; border: 1px solid #ddd;">Details</th>
-                                <th style="text-align: left; padding: 8px; border: 1px solid #ddd;">Values</th>
-                            </tr>
-                            <tr>
-                                <td style="padding: 8px; border: 1px solid #ddd;">Git Repository</td>
-                                <td style="padding: 8px; border: 1px solid #ddd;">${GIT_REPO}</td>
-                            </tr>
-                            <tr>
-                                <td style="padding: 8px; border: 1px solid #ddd;">Branch</td>
-                                <td style="padding: 8px; border: 1px solid #ddd;">${GIT_BRANCH}</td>
-                            </tr>
-                            <tr>
-                                <td style="padding: 8px; border: 1px solid #ddd;">Docker Image</td>
-                                <td style="padding: 8px; border: 1px solid #ddd;">${DOCKERHUB_USERNAME}/${DOCKER_IMAGE}:${params.GEMINI_DOCKER_TAG}</td>
-                            </tr>
-                        </table>
-                        <p style="font-size: 16px; color: #333; margin-top: 20px;">
-                            Visit <a href="${BUILD_URL}" style="color: #F44336;">Pipeline Logs</a> for more details.
-                        </p>
-                        <p style="font-size: 16px; color: #333; margin-top: 20px;">
-                            Thanks,<br>
-                            <strong>Jenkins</strong>
-                        </p>
-                    </div>
-                """,
-                to: "amitabhdevops2024@gmail.com",
-                from: "jenkins@example.com",
-                mimeType: 'text/html',
-                attachmentsPattern: '**/table-report.html'
+            // Critical failures alert
+            slackSend(
+                color: 'danger',
+                channel: '#alerts',
+                message: """🚨 FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}
+                            | Error: ${currentBuild.currentResult}
+                            | Console: ${env.BUILD_URL}console"""
             )
+        }
+        unstable {
+            // Test failures alert
+            emailext body: "Unit tests failed in ${env.BUILD_URL}testReport",
+                     subject: "UNSTABLE: ${env.JOB_NAME}",
+                     to: 'qa-team@example.com'
         }
     }
 }
